@@ -1,4 +1,3 @@
-# src/main.py
 """
 CarePath — Application Entry Point
 ====================================

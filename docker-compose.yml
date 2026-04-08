@@ -1,0 +1,93 @@
+# docker-compose.yml
+# ==================
+# CarePath — Local Development Environment
+#
+# Starts three services:
+#   postgres  → the database
+#   pgadmin   → visual DB manager (browser-based)
+#   api       → the FastAPI server
+#
+# Usage:
+#   docker compose up -d          → start all services
+#   docker compose down           → stop all services
+#   docker compose logs api -f    → follow API logs
+#   docker compose ps             → check status
+
+services:
+
+  # ── PostgreSQL Database ─────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    # Why pgvector/pgvector and not postgres:16?
+    # Because we need the pgvector extension for semantic search.
+    # This image is official PostgreSQL 16 + pgvector pre-installed.
+    container_name: carepath_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: carepath
+    ports:
+      - "5432:5432"
+      # left side  = your laptop's port
+      # right side = port inside the container
+      # This lets your local tools connect to the DB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # This volume persists DB data across container restarts
+      # Without this, every 'docker compose down' erases the DB
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # Docker waits for postgres to be ready before
+      # starting the API server — prevents race conditions
+
+      # ── pgAdmin — Visual Database Manager ──────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: carepath_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@carepath.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+      # Access pgAdmin at http://localhost:5050
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  # ── FastAPI Application ─────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: carepath_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/carepath
+      # Note: hostname is 'postgres' (the service name above)
+      # not 'localhost' — inside Docker, services find each other
+      # by service name, not localhost
+      DEBUG: "true"
+      SECRET_KEY: dev-secret-key-not-for-production
+    depends_on:
+      postgres:
+        condition: service_healthy
+        # Only start API after postgres passes health check
+    volumes:
+      - .:/app
+      # Mount current directory into container
+      # Changes to your code are reflected immediately
+      # without rebuilding the container
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+    # Named volumes — managed by Docker
+    # Persist data even when containers are stopped

@@ -18,3 +18,4 @@ api_router = APIRouter()
 
 api_router.include_router(patients.router)
 api_router.include_router(cases.router)
+
