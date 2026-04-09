@@ -1,60 +1,43 @@
-"""
-CarePath — Triage Case Endpoints
-==================================
-The core of CarePath's medical functionality.
-
-Routes:
-  POST /cases              → open a new triage case
-  GET  /cases/{id}         → get case details and priority
-  POST /cases/{id}/evaluate → run the triage algorithm
-  POST /cases/{id}/resolve  → close with recommendation
-"""
 from uuid import UUID
+from fastapi import APIRouter, HTTPException, status, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 
-from fastapi import APIRouter, HTTPException, status
-
+# Importamos tus dependencias de seguridad y base de datos
+from src.api.deps import get_db, get_current_active_patient, get_current_doctor
 from src.models.enums import CaseStatus, TriagePriority
-from src.models.symptom import Symptom
+from src.models.db.patient_db import PatientDB
 from src.models.triage import TriageCase, TriageCaseCreate
+from src.models.symptom import Symptom
 
 router = APIRouter(
     prefix="/cases",
     tags=["triage cases"],
 )
 
-# Temporary in-memory store
-_cases_db: dict[UUID, TriageCase] = {}
-
 @router.post(
     "/",
     response_model=TriageCase,
     status_code=status.HTTP_201_CREATED,
-    summary="Open a new triage case",
-    description="""
-    Opens a new triage case with the patient's symptoms.
-    
-    The case starts with status OPEN.
-    Call POST /cases/{id}/evaluate to run the triage algorithm
-    and receive a priority level.
-    """,
+    summary="Abrir un nuevo caso de triaje",
 )
-async def create_case(case_data: TriageCaseCreate) -> TriageCase:
-    """
-    POST /api/v1/cases
-    
-    Creates a TriageCase from the submitted data.
-    Converts SymptomCreate objects to Symptom objects
-    with generated IDs and timestamps.
-    """
-    # Create the case first to get its ID
+async def create_case(
+    case_data: TriageCaseCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_active_patient),
+) -> TriageCase:
+    # SEGURIDAD: Forzamos que el paciente del caso sea el usuario autenticado
+    # Ignoramos cualquier patient_id que el usuario intente enviar en el JSON
     new_case = TriageCase(
-        patient_id=case_data.patient_id,
+        patient_id=current_user.id,
         chief_complaint=case_data.chief_complaint,
+        status=CaseStatus.OPEN
     )
+    
+    db.add(new_case)
+    await db.flush()  # Generamos el ID del caso
 
-    # Convert SymptomCreate → Symptom
-    # SymptomCreate has no ID or case_id
-    # Symptom has both — created here with the case's ID
+    # Mapeo explícito de síntomas para evitar inyección de datos
     symptoms = [
         Symptom(
             description=s.description,
@@ -62,108 +45,99 @@ async def create_case(case_data: TriageCaseCreate) -> TriageCase:
             duration_hours=s.duration_hours,
             body_location=s.body_location,
             is_worsening=s.is_worsening,
-            case_id=new_case.id,     # link symptom to this case
+            case_id=new_case.id
         )
-        for s in case_data.symptoms  # list comprehension
+        for s in case_data.symptoms
     ]
-
-    new_case.symptoms = symptoms
-    _cases_db[new_case.id] = new_case
-
+    
+    db.add_all(symptoms)
+    await db.commit()
+    await db.refresh(new_case)
     return new_case
 
 @router.get(
     "/{case_id}",
     response_model=TriageCase,
-    summary="Get triage case details",
+    summary="Ver detalles del caso",
 )
-async def get_case(case_id: UUID) -> TriageCase:
-    """GET /api/v1/cases/{case_id}"""
-    case = _cases_db.get(case_id)
-    if case is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Case {case_id} not found",
-        )
-    return case
+async def get_case(
+    case_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_active_patient),
+) -> TriageCase:
+    result = await db.execute(select(TriageCase).where(TriageCase.id == case_id))
+    case = result.scalars().first()
 
+    if not case:
+        raise HTTPException(status_code=404, detail="Caso no encontrado")
+    
+    # SEGURIDAD: Un paciente NO puede ver casos de otros pacientes (IDOR protection)
+    if case.patient_id != current_user.id:
+        raise HTTPException(status_code=403, detail="No autorizado para ver este caso")
+        
+    return case
 
 @router.post(
     "/{case_id}/evaluate",
     response_model=TriageCase,
-    summary="Run triage algorithm on this case",
-    description="""
-    Runs the START triage protocol on the case's symptoms.
-    
-    Returns the case with priority set to one of:
-    - P1_immediate: life-threatening, go to ER now
-    - P2_urgent: serious, urgent care within 1 hour
-    - P3_delayed: moderate, can wait 1-2 hours
-    - P4_minimal: minor, self-care appropriate
-    
-    Transitions status from OPEN to IN_REVIEW.
-    """,
+    summary="Ejecutar algoritmo de triaje",
 )
-async def evaluate_case(case_id: UUID) -> TriageCase:
-    """
-    POST /api/v1/cases/{case_id}/evaluate
-    
-    This endpoint runs the core CarePath algorithm.
-    In Lesson 5 (AI), this will also call the LLM
-    to generate a natural language recommendation.
-    """
-    case = _cases_db.get(case_id)
-    if case is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Case {case_id} not found",
-        )
+async def evaluate_case(
+    case_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_active_patient),
+) -> TriageCase:
+    result = await db.execute(select(TriageCase).where(TriageCase.id == case_id))
+    case = result.scalars().first()
+
+    # Validación de existencia y propiedad
+    if not case or case.patient_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Caso no encontrado")
 
     if case.status != CaseStatus.OPEN:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Case is already {case.status.value} — cannot re-evaluate",
+            detail=f"El caso ya está en estado: {case.status.value}"
         )
 
-    # Run the START protocol algorithm
-    # This is the method you built in triage.py
+    # Ejecuta el protocolo START definido en tu modelo triage.py
     case.calculate_priority()
 
-    # Auto-escalate P1 cases
     if case.priority == TriagePriority.P1_IMMEDIATE:
         case.escalate()
+    else:
+        case.status = CaseStatus.IN_REVIEW
 
+    await db.commit()
+    await db.refresh(case)
     return case
-
 
 @router.post(
     "/{case_id}/resolve",
     response_model=TriageCase,
-    summary="Resolve case with medical recommendation",
+    summary="Resolver caso (Solo Doctores)",
 )
 async def resolve_case(
     case_id: UUID,
     recommendation: str,
+    db: AsyncSession = Depends(get_db),
+    # SEGURIDAD: Cambiamos a get_current_doctor para que un paciente no se autorrecete
+    current_user: PatientDB = Depends(get_current_doctor),
 ) -> TriageCase:
-    """
-    POST /api/v1/cases/{case_id}/resolve
-    
-    Closes the case with a medical recommendation.
-    In Lesson 5 (AI), the recommendation will be
-    generated by the LLM. For now, it's passed manually.
-    """
-    case = _cases_db.get(case_id)
-    if case is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Case {case_id} not found",
-        )
+    result = await db.execute(select(TriageCase).where(TriageCase.id == case_id))
+    case = result.scalars().first()
+
+    if not case:
+        raise HTTPException(status_code=404, detail="Caso no encontrado")
 
     if case.status != CaseStatus.IN_REVIEW:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Case must be IN_REVIEW before resolving",
+            detail="El caso debe estar IN_REVIEW para ser resuelto"
         )
 
     case.resolve(recommendation)
+    
+    await db.commit()
+    await db.refresh(case)
     return case

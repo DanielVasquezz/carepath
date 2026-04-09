@@ -1,4 +1,3 @@
-# src/api/v1/endpoints/patients.py
 """
 CarePath — Patient Endpoints
 ==============================
@@ -14,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.database import get_db
 from src.models.db.patient_db import PatientDB
 from src.models.patient import Patient, PatientCreate
+from src.core.security import hash_password
+# CORRECCIÓN AQUÍ: Importamos desde deps, no desde security
+from src.api.deps import get_current_user
 
 router = APIRouter(
     prefix="/patients",
@@ -54,10 +56,14 @@ async def create_patient(
         email=patient_data.email,
         date_of_birth=patient_data.date_of_birth,
         phone=patient_data.phone,
-        hashed_password=patient_data.password,  # TODO: bcrypt in Lesson 5
+        hashed_password=hash_password(patient_data.password),  # bcrypt now
     )
+    
     db.add(db_patient)
     await db.flush()
+    # AGREGADO: Necesario para guardar en PostgreSQL realmente
+    await db.commit()
+    await db.refresh(db_patient)
 
     return Patient(
         id=db_patient.id,
@@ -69,15 +75,18 @@ async def create_patient(
     )
 
 
-@router.get(
-    "/{patient_id}",
-    response_model=Patient,
-    summary="Get patient by ID",
-)
+# En src/api/v1/endpoints/patients.py
+
+@router.get("/{patient_id}", response_model=Patient)
 async def get_patient(
     patient_id: UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_user),
 ) -> Patient:
+
+    if current_user.role == UserRole.PATIENT and current_user.id != patient_id:
+        raise HTTPException(status_code=403, detail="No tienes permiso para ver otros perfiles")
+    
     result = await db.execute(
         select(PatientDB).where(
             PatientDB.id == patient_id,
@@ -109,10 +118,11 @@ async def get_patient(
 )
 async def list_patients(
     db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_user),  
 ) -> list[Patient]:
     result = await db.execute(
         select(PatientDB)
-        .where(PatientDB.is_active == True)  # noqa: E712
+        .where(PatientDB.is_active == True)
         .order_by(PatientDB.created_at.desc())
     )
     db_patients = result.scalars().all()
