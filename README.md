@@ -88,7 +88,7 @@ CarePath implements the international **START triage protocol**:
 - [x] Phase 2 — Domain models with OOP (Patient, Symptom, TriageCase)
 - [x] Phase 3 — REST API with FastAPI + automatic OpenAPI docs
 - [x] Phase 4 — PostgreSQL persistence with Docker + Alembic migrations
-- [ ] Phase 5 — Security: JWT + bcrypt + RBAC
+- [x] Phase 5 — Security: JWT + bcrypt + RBAC
 - [ ] Phase 6 — AWS infrastructure with Terraform
 - [ ] Phase 7 — AI triage engine with LangChain + pgvector
 
