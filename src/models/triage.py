@@ -14,10 +14,14 @@ class TriageCaseCreate(BaseModel):
     """
     Data required to open a new triage case.
     Received by: POST /api/v1/cases
+
+    patient_id is Optional here because it is injected
+    automatically from the JWT token in the endpoint.
+    Any value sent in the request body is ignored.
     """
-    patient_id: UUID = Field(
-        ...,
-        description="The patient opening this case"
+    patient_id: UUID | None = Field(
+        default=None,
+        description="Ignored — taken from JWT token automatically"
     )
     chief_complaint: str = Field(
         ...,
