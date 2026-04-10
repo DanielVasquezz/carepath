@@ -9,7 +9,3 @@ psycopg2-binary==2.9.9
 
 pydantic==2.12.5
 pydantic-settings==2.13.1
-
-numpy==2.4.4
-
-ollama==0.6.1
