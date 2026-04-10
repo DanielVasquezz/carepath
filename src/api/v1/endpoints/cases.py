@@ -10,7 +10,14 @@ Security:
   - Only doctors can resolve cases (RBAC)
   - JWT required for all endpoints
 """
+
+from src.services.ai_service import (
+    generate_symptom_embeddings,
+    generate_triage_recommendation,
+)
+
 from uuid import UUID
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -34,12 +41,7 @@ router = APIRouter(
 def db_case_to_pydantic(db_case: TriageCaseDB) -> TriageCase:
     """
     Converts a SQLAlchemy TriageCaseDB object to a Pydantic TriageCase.
-
-    Why this function exists:
-    SQLAlchemy models handle persistence.
-    Pydantic models handle API responses.
-    This converter is the bridge between the two worlds.
-    Without it, FastAPI cannot serialize the response correctly.
+    Bridge between DB persistence and API serialization.
     """
     symptoms = [
         Symptom(
@@ -82,21 +84,18 @@ async def create_case(
 ) -> TriageCase:
     """
     POST /api/v1/cases/
-
-    SECURITY: patient_id is taken from the JWT token — not from
-    the request body. A patient cannot open a case for another patient.
-    This prevents IDOR (Insecure Direct Object Reference) attacks.
+    Crea un caso y genera automáticamente los embeddings de los síntomas.
     """
-    # Create the case in the database
+    # 1. Crear el caso en la base de datos
     db_case = TriageCaseDB(
-        patient_id=current_user.id,  # from JWT — not from request body
+        patient_id=current_user.id,
         chief_complaint=case_data.chief_complaint,
         status=CaseStatus.OPEN.value,
     )
     db.add(db_case)
-    await db.flush()  # generates db_case.id without committing
+    await db.flush()  # Genera db_case.id
 
-    # Create symptoms linked to this case
+    # 2. Crear síntomas vinculados
     db_symptoms = [
         SymptomDB(
             case_id=db_case.id,
@@ -109,10 +108,15 @@ async def create_case(
         for s in case_data.symptoms
     ]
     db.add_all(db_symptoms)
-    await db.flush()
+    await db.flush() # Necesario para que db_symptoms tengan IDs
 
-    # Reload with symptoms for the response
-    await db.refresh(db_case)
+    # --- NUEVO: Generar embeddings para búsqueda semántica inmediata ---
+    await generate_symptom_embeddings(db_symptoms, db)
+
+    # 3. Confirmar transacción
+    await db.commit()
+
+    # 4. Recargar el caso con sus síntomas para la respuesta
     result = await db.execute(
         select(TriageCaseDB)
         .where(TriageCaseDB.id == db_case.id)
@@ -135,11 +139,7 @@ async def get_case(
 ) -> TriageCase:
     """
     GET /api/v1/cases/{case_id}
-
-    SECURITY: Patients can only see their own cases.
-    Accessing another patient's case returns 404 — not 403.
-    Why 404 and not 403? Because returning 403 confirms the case
-    exists. 404 reveals nothing about other patients' data.
+    Acceso restringido: El paciente solo ve sus propios casos.
     """
     result = await db.execute(
         select(TriageCaseDB)
@@ -163,21 +163,13 @@ async def get_case(
 @router.post(
     "/{case_id}/evaluate",
     response_model=TriageCase,
-    summary="Run START triage algorithm",
+    summary="Run START triage algorithm + AI recommendation",
 )
 async def evaluate_case(
     case_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: PatientDB = Depends(get_current_active_patient),
 ) -> TriageCase:
-    """
-    POST /api/v1/cases/{case_id}/evaluate
-
-    Runs the START triage protocol on the case symptoms.
-    Converts DB model → Pydantic model → runs algorithm →
-    saves results back to DB.
-    """
-    # Load case with symptoms from DB
     result = await db.execute(
         select(TriageCaseDB)
         .where(
@@ -189,89 +181,40 @@ async def evaluate_case(
     db_case = result.scalar_one_or_none()
 
     if db_case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    # MODIFICACIÓN: Permitir re-evaluar si está en 'in_review' pero NO tiene recomendación
+    if db_case.status != CaseStatus.OPEN.value and db_case.ai_recommendation is not None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Case not found",
+            status_code=400,
+            detail=f"Case is already {db_case.status} with a recommendation"
         )
 
-    if db_case.status != CaseStatus.OPEN.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Case is already {db_case.status} — cannot re-evaluate",
-        )
+    # 1. Asegurar embeddings
+    await generate_symptom_embeddings(db_case.symptoms, db)
 
-    # Convert to Pydantic to run the algorithm
+    # 2. Algoritmo START
     pydantic_case = db_case_to_pydantic(db_case)
     priority = pydantic_case.calculate_priority()
 
-    # Save results back to the DB model
+    # 3. Actualizar datos (Sin commit todavía para evitar bloqueos)
     db_case.priority = priority.value
     db_case.status = CaseStatus.IN_REVIEW.value
 
-    # Auto-escalate P1 cases
     if priority == TriagePriority.P1_IMMEDIATE:
-        from datetime import datetime
         db_case.status = CaseStatus.ESCALATED.value
         db_case.resolved_at = datetime.utcnow()
 
-    await db.commit()
-
-    # Reload for response
-    result = await db.execute(
-        select(TriageCaseDB)
-        .where(TriageCaseDB.id == case_id)
-        .options(selectinload(TriageCaseDB.symptoms))
-    )
-    db_case = result.scalar_one()
-    return db_case_to_pydantic(db_case)
-
-
-@router.post(
-    "/{case_id}/resolve",
-    response_model=TriageCase,
-    summary="Resolve case with recommendation — doctors only",
-)
-async def resolve_case(
-    case_id: UUID,
-    recommendation: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: PatientDB = Depends(get_current_doctor),
-    # RBAC: only doctors can resolve cases
-    # A patient cannot write their own medical recommendation
-) -> TriageCase:
-    """
-    POST /api/v1/cases/{case_id}/resolve
-
-    RBAC: restricted to DOCTOR role.
-    Patients cannot self-prescribe recommendations.
-    """
-    result = await db.execute(
-        select(TriageCaseDB)
-        .where(TriageCaseDB.id == case_id)
-        .options(selectinload(TriageCaseDB.symptoms))
-    )
-    db_case = result.scalar_one_or_none()
-
-    if db_case is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Case not found",
-        )
-
-    if db_case.status != CaseStatus.IN_REVIEW.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Case must be IN_REVIEW before resolving",
-        )
-
-    from datetime import datetime
+    # 4. Generar recomendación de IA
+    # Si esto falla, lanzará una excepción y el status NO se guardará en la DB
+    recommendation = await generate_triage_recommendation(db_case, db)
     db_case.ai_recommendation = recommendation
-    db_case.status = CaseStatus.RESOLVED.value
-    db_case.resolved_at = datetime.utcnow()
-    db_case.attending_doctor_id = current_user.id
 
+    # 5. COMMIT ÚNICO FINAL
+    # Solo guardamos si TODO el proceso (incluyendo la IA) salió bien
     await db.commit()
 
+    # Recargar para respuesta
     result = await db.execute(
         select(TriageCaseDB)
         .where(TriageCaseDB.id == case_id)

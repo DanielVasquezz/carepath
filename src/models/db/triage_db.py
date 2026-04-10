@@ -18,7 +18,7 @@ from datetime import datetime
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
+from pgvector.sqlalchemy import Vector
 from src.core.database import Base
 
 
@@ -58,6 +58,14 @@ class SymptomDB(Base):
     reported_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(384),
+        nullable=True,
+        # 384 dimensions = output size of all-MiniLM-L6-v2
+        # This column stores the semantic meaning of the symptom description
+        # Used for similarity search: find symptoms that mean the same thing
+        # even if described with different words
     )
 
     # ── Relationship ─────────────────────────────────────────────
