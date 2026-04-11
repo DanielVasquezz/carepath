@@ -1,41 +1,35 @@
-# alembic/env.py
+import sys
+from os import path
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
+from sqlalchemy import create_engine, pool
 from alembic import context
 
-# ─── AGREGA ESTAS 4 LÍNEAS AQUÍ ───────────────────────────────────
+# ─── CONFIGURACIÓN DE RUTAS ───────────────────────────────────────
+# Esto permite que Alembic encuentre el módulo 'src' en la raíz
+sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
+
 from src.core.config import settings
 from src.core.database import Base
 from src.models.db.patient_db import PatientDB      # noqa: F401
 from src.models.db.triage_db import SymptomDB, TriageCaseDB  # noqa: F401
 # ──────────────────────────────────────────────────────────────────
 
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
+# Objeto de configuración de Alembic
 config = context.config
 
-# Interpret the config file for Python logging.
+# Interpretar el archivo de log
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# ─── CAMBIA ESTA LÍNEA ────────────────────────────────────────────
-# ANTES: target_metadata = None
-# DESPUÉS:
+# Metadata de los modelos
 target_metadata = Base.metadata
-# ──────────────────────────────────────────────────────────────────
 
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
-
-    # ─── CAMBIA ESTA LÍNEA DENTRO DE run_migrations_offline ───────
-    # ANTES: url = config.get_main_option("sqlalchemy.url")
-    # DESPUÉS:
+    # Usamos la property y reemplazamos el driver
     url = settings.DATABASE_URL.replace("+asyncpg", "+psycopg2")
-    # ──────────────────────────────────────────────────────────────
 
     context.configure(
         url=url,
@@ -50,16 +44,14 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
+    # Reemplazamos +asyncpg por +psycopg2 para que Alembic pueda conectar
+    sync_url = settings.DATABASE_URL.replace("+asyncpg", "+psycopg2")
 
-    # ─── REEMPLAZA TODA ESTA SECCIÓN ──────────────────────────────
-    # ANTES era: connectable = engine_from_config(...)
-    # DESPUÉS:
-    from sqlalchemy import create_engine
-
+    # Creamos el engine síncrono
     connectable = create_engine(
-        settings.DATABASE_URL.replace("+asyncpg", "+psycopg2")
+        sync_url,
+        poolclass=pool.NullPool,
     )
-    # ──────────────────────────────────────────────────────────────
 
     with connectable.connect() as connection:
         context.configure(

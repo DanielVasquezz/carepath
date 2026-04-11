@@ -1,70 +1,63 @@
 """
 CarePath — Application Configuration
 =====================================
-Central settings management using Pydantic Settings.
-
-Why centralize settings here?
-Because configuration scattered across files is the #1 cause
-of "works on my machine" bugs. One file. One source of truth.
-
-Environment variables override defaults automatically.
-In production (AWS), these come from environment variables.
-In development, they come from the .env file.
-The code never changes — only the environment does.
+Central settings management usando Pydantic Settings.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional, List
+
 
 class Settings(BaseSettings):
-    """
-    Application settings loaded from environment variables.
-    
-    Pydantic validates every setting on startup.
-    If DATABASE_URL is missing in production, the app
-    refuses to start with a clear error — not a cryptic
-    runtime failure 10 minutes later.
-    """
-    
-    # ── Application ──────────────────────────────────────
+    # ── App ─────────────────────────────
     APP_NAME: str = "CarePath"
     APP_VERSION: str = "0.1.0"
-    APP_DESCRIPTION: str = (
-        "Intelligent medical triage and follow-up system powered by AI"
-    )
-    DEBUG: bool = False
-    API_V1_PREFIX: str = "/api/v1"  
-    
-    # ── Database ──────────────────────────────────────────
-    DATABASE_URL: str = (
-        "postgresql+asyncpg://postgres:postgres@localhost:5432/carepath"
-    )
-    
-    # ── Security ──────────────────────────────────────────
-    SECRET_KEY: str = "change-this-in-production-use-openssl-rand-hex-32"
+    APP_DESCRIPTION: str = "CarePath API"
+    DEBUG: bool = True
+
+    # ── API ─────────────────────────────
+    API_V1_PREFIX: str = "/api/v1"
+
+    # ── CORS ────────────────────────────
+    ALLOWED_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+    # ── Security ────────────────────────
+    SECRET_KEY: str = "dev_secret"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    
-    # ── AI / LLM ──────────────────────────────────────────
-    OPENAI_API_KEY: str = "sk-placeholder"
+
+    # ── DB ──────────────────────────────
+    DB_USER: str = "postgres"
+    DB_PASSWORD: str = "postgres"
+    DB_HOST: str = "localhost"
+    DB_PORT: str = "5432"
+    DB_NAME: str = "carepath_db"
+    CLOUD_SQL_INSTANCE: Optional[str] = None
+
+    # ── AI / LLM (OpenAI) ───────────────
+    OPENAI_API_KEY: str = "tu_key_aqui"
     LLM_MODEL: str = "gpt-4o-mini"
-    LL_MAX_TOKENS: int = 1000
-    
-    # ── CORS ──────────────────────────────────────────────
-    # Which frontend domains can call our API
-    
-    ALLOWED_ORIGINS: list[str] = [
-        "http://localhost:3000",    # React dev server
-        "http://localhost:8080",    # Vue dev server
-        "https://carepath.app",     # production frontend
-    ]  
-    
+
+    @property
+    def DATABASE_URL(self) -> str:
+        """
+        Genera dinámicamente la URL de conexión para SQLAlchemy.
+        """
+        return (
+            f"postgresql+asyncpg://"
+            f"{self.DB_USER}:{self.DB_PASSWORD}"
+            f"@{self.DB_HOST}:{self.DB_PORT}/"
+            f"{self.DB_NAME}"
+        )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=True,
+        extra="ignore"
     )
 
-# Singleton — one instance shared across the entire app
-# Import this wherever you need settings:
-# from src.core.config import settings
+
 settings = Settings()

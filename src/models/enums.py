@@ -1,64 +1,66 @@
 from enum import Enum
 
 
+# ─────────────────────────────────────────────
+# SEVERITY LEVEL
+# ─────────────────────────────────────────────
 class SeverityLevel(str, Enum):
     """
     Clinical severity level of a reported symptom.
-    Inherits from str for automatic JSON serialization.
-
-    Used by: Symptom, TriageCase
+    Used to determine urgency of medical attention.
     """
-    LOW = "low"           # monitor at home, no immediate action
-    MODERATE = "moderate" # medical appointment within 24-48 hours
-    HIGH = "high"         # urgent care required today
-    CRITICAL = "critical" # emergency room immediately, call 911
 
+    LOW = "low"           # monitor at home
+    MODERATE = "moderate" # appointment within 24-48h
+    HIGH = "high"         # urgent care same day
+    CRITICAL = "critical" # emergency care immediately
+
+
+# ─────────────────────────────────────────────
+# TRIAGE PRIORITY (START PROTOCOL)
+# ─────────────────────────────────────────────
 class TriagePriority(str, Enum):
     """
-    Priority level assigned to a triage case.
-    
-    Based on the START triage protocol — the international
-    standard used by emergency medical services worldwide.
-    
-    P1 = most urgent / P4 = least urgent
-    Used by: TriageCase.calculate_priority()
+    Priority level assigned using START triage protocol.
+
+    P1 = highest urgency
+    P4 = lowest urgency
     """
-    
+
     P1_IMMEDIATE = "P1_immediate"
     P2_URGENT    = "P2_urgent"
     P3_DELAYED   = "P3_delayed"
     P4_MINIMAL   = "P4_minimal"
 
+
+# ─────────────────────────────────────────────
+# CASE STATUS (STATE MACHINE)
+# ─────────────────────────────────────────────
 class CaseStatus(str, Enum):
     """
-    Lifecycle states of a triage case.
-    
-    A case always moves FORWARD through states — never backwards.
-    This is called a State Machine — a pattern used in every
-    serious business application.
-    
-    Valid transitions:
-        OPEN → IN_REVIEW → RESOLVED
-        OPEN → IN_REVIEW → ESCALATED
+    Lifecycle of a triage case.
+
+    OPEN → IN_REVIEW → RESOLVED / ESCALATED
     """
 
-    OPEN = "open"           # new case, not yet reviewed
-    IN_REVIEW = "in_review" # clinician is actively reviewing
-    RESOLVED = "resolved"   # case closed, no further action needed
-    ESCALATED = "escalated" # transferred to human clinician for urgent review
-    
+    OPEN = "open"
+    IN_REVIEW = "in_review"
+    RESOLVED = "resolved"
+    ESCALATED = "escalated"
+
+
+# ─────────────────────────────────────────────
+# USER ROLES (RBAC)
+# ─────────────────────────────────────────────
 class UserRole(str, Enum):
-        """
-    Roles within the CarePath system.
-    
-    Determines what each user can SEE and DO.
-    This is called Role-Based Access Control (RBAC) —
-    the industry standard for authorization in medical systems.
-    
-    PATIENT  → can only see their own cases
-    DOCTOR   → can see assigned cases, write recommendations  
-    ADMIN    → full system access, audit logs
     """
-        PATIENT = "patient"
-        DOCTOR  = "doctor"
-        ADMIN   = "admin"
+    Role-Based Access Control (RBAC) system.
+
+    PATIENT → own data only
+    DOCTOR  → assigned cases
+    ADMIN   → full system access
+    """
+
+    PATIENT = "patient"
+    DOCTOR = "doctor"
+    ADMIN = "admin"

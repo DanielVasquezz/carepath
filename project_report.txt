@@ -1,0 +1,799 @@
+=== CAREPATH PROJECT STRUCTURE ===
+./
+    .DS_Store
+    requirements.txt
+    alembic.ini
+    Dockerfile
+    list_routes.py
+    inspect_project.py
+    test_flow.py
+    README.md
+    .gitignore
+    test_system.py
+    .env
+    .python-version
+    inspect_system.py
+    docker-compose.yml
+    .env.example
+    infra/
+        terraform.tfstate.backup
+        terraform.tfstate
+        main.tf
+        .gitignore
+        main.py
+        .terraform.lock.hcl
+        .terraform/
+            providers/
+                registry.terraform.io/
+                    hashicorp/
+                        aws/
+                            5.100.0/
+                                darwin_amd64/
+                                    terraform-provider-aws_v5.100.0_x5
+                                    LICENSE.txt
+                            6.40.0/
+                                darwin_amd64/
+                                    terraform-provider-aws_v6.40.0_x5
+                                    LICENSE.txt
+    tests/
+        __init__.py
+        test_models.py
+    docs/
+        .DS_Store
+        adr/
+            001-stack-decision.md
+        diagrams/
+        deployment/
+    alembic/
+        script.py.mako
+        env.py
+        versions/
+            bebee66fea38_add_embedding_column_to_symptoms.py
+            9d4690a9aea9_update_embedding_dimension_to_768.py
+            5b4827cd9c58_create_initial_tables.py
+            c24377f9cecc_update_embedding_dimension_to_768.py
+    src/
+        .DS_Store
+        __init__.py
+        main.py
+        core/
+            config.py
+            database.py
+            security.py
+            __init__.py
+        models/
+            symptom.py
+            enums.py
+            patient.py
+            __init__.py
+            triage.py
+            doctor.py
+            db/
+                __init__.py
+                patient_db.py
+                triage_db.py
+        api/
+            deps.py
+            __init__.py
+            v1/
+                __init__.py
+                router.py
+                endpoints/
+                    auth.py
+                    __init__.py
+                    cases.py
+                    patients.py
+        services/
+            ai_service.py
+            __init__.py
+            triage_logic.py
+
+=== KEY FILE CONTENTS ===
+
+--- FILE: src/main.py ---
+"""
+CarePath — Application Entry Point
+===================================
+✔ Monitoring middleware (latency + errors)
+✔ CORS safe config
+✔ Custom OpenAPI (OAuth2 Swagger fix)
+✔ Clean architecture
+✔ Health + root endpoints
+"""
+
+import time
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+
+from src.api.v1.router import api_router
+from src.core.config import settings
+
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger("CarePath-System")
+
+
+# ─────────────────────────────────────────────
+# APP INIT
+# ─────────────────────────────────────────────
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.APP_DESCRIPTION,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
+
+
+# ─────────────────────────────────────────────
+# MIDDLEWARE (MONITORING)
+# ─────────────────────────────────────────────
+@app.middleware("http")
+async def monitor_requests(request: Request, call_next):
+    start = time.time()
+
+    try:
+        response = await call_next(request)
+        duration = time.time() - start
+
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"| status={response.status_code} "
+            f"| latency={duration:.4f}s"
+        )
+
+        return response
+
+    except Exception as e:
+        duration = time.time() - start
+
+        logger.error(
+            f"{request.method} {request.url.path} "
+            f"| ERROR | latency={duration:.4f}s | {str(e)}"
+        )
+        raise
+
+
+# ─────────────────────────────────────────────
+# CORS
+# ─────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # en prod: restringir dominios
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────
+# CUSTOM OPENAPI (SWAGGER AUTH FIX)
+# ─────────────────────────────────────────────
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title="CarePath — Inteligencia Médica",
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    # OAuth2 Swagger fix
+    schema["components"]["securitySchemes"] = {
+        "OAuth2PasswordBearer": {
+            "type": "oauth2",
+            "flows": {
+                "password": {
+                    "tokenUrl": f"{settings.API_V1_PREFIX}/auth/login",
+                    "scopes": {},
+                }
+            },
+        }
+    }
+
+    # Seguridad global Swagger
+    schema["security"] = [{"OAuth2PasswordBearer": []}]
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
+app.include_router(
+    api_router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+
+# ─────────────────────────────────────────────
+# HEALTH CHECKS
+# ─────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "app": settings.APP_NAME,
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "CarePath API running",
+        "version": settings.APP_VERSION,
+    }
+
+--- FILE: src/core/config.py ---
+"""
+CarePath — Application Configuration
+=====================================
+Central settings management usando Pydantic Settings.
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional, List
+
+
+class Settings(BaseSettings):
+    # ── App ─────────────────────────────
+    APP_NAME: str = "CarePath"
+    APP_VERSION: str = "0.1.0"
+    APP_DESCRIPTION: str = "CarePath API"
+    DEBUG: bool = True
+
+    # ── API ─────────────────────────────
+    API_V1_PREFIX: str = "/api/v1"
+
+    # ── CORS ────────────────────────────
+    ALLOWED_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+    # ── Security ────────────────────────
+    SECRET_KEY: str = "dev_secret"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    # ── DB ──────────────────────────────
+    # Estos se llenan desde el .env. Si no están en el .env, usan estos defaults.
+    DB_USER: str = "postgres"
+    DB_PASS: str = "postgres"
+    DB_HOST: str = "localhost"
+    DB_PORT: str = "5432"
+    DB_NAME: str = "carepath_db"
+    CLOUD_SQL_INSTANCE: Optional[str] = None
+
+    @property
+    def DATABASE_URL(self) -> str:
+        """
+        Genera dinámicamente la URL de conexión para SQLAlchemy.
+        Alembic usará esto y reemplazará +asyncpg por +psycopg2 automáticamente.
+        """
+        return f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASS}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+
+settings = Settings()
+
+--- FILE: src/core/security.py ---
+# src/core/security.py
+"""
+CarePath — Security Engine
+===========================
+Handles all cryptographic operations:
+  - Password hashing with native bcrypt
+  - JWT token creation and verification
+  - User extraction from tokens
+
+Why centralize security here?
+Because security logic scattered across files is how
+vulnerabilities are introduced. One file, one place
+to audit, one place to update if an algorithm changes.
+
+OWASP compliance:
+  A02 — Cryptographic Failures: bcrypt with cost factor 12
+  A07 — Identification and Authentication Failures: JWT with expiry
+"""
+
+import bcrypt
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import UUID
+
+from jose import jwt, JWTError
+
+from src.core.config import settings
+
+
+# ── Password Hashing (Native Bcrypt) ──────────────────────────────
+def hash_password(plain_password: str) -> str:
+    """
+    Converts plain text password to bcrypt hash using native bcrypt.
+
+    Example:
+        "securepass123" → "$2b$12$...."
+
+    One-way function: irreversible.
+    """
+    pwd_bytes = plain_password.encode("utf-8")
+    salt = bcrypt.gensalt(rounds=12)
+    hashed = bcrypt.hashpw(pwd_bytes, salt)
+    return hashed.decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Verifies a plain text password against its stored bcrypt hash.
+
+    Uses timing-safe comparison internally via bcrypt.
+    """
+    try:
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8"),
+        )
+    except Exception:
+        return False
+
+
+# ── JWT Token Operations ──────────────────────────────────────────
+def create_access_token(
+    subject: UUID | str,
+    role: str,
+    expires_delta: timedelta | None = None,
+) -> str:
+    """
+    Creates a signed JWT access token.
+
+    Payload includes:
+        sub  → user ID (UUID as string)
+        role → user role for RBAC
+        exp  → expiration time
+        iat  → issued at time
+    """
+    now = datetime.now(timezone.utc)
+
+    expire = now + (
+        expires_delta
+        or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "role": role,
+        "exp": expire,
+        "iat": now,
+    }
+
+    return jwt.encode(
+        payload,
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    """
+    Decodes and verifies JWT token.
+
+    Raises:
+        JWTError: if token is invalid, expired, or tampered.
+    """
+    try:
+        return jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+        )
+    except JWTError as e:
+        raise e
+
+--- FILE: src/core/database.py ---
+# src/core/database.py
+from collections.abc import AsyncGenerator
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+from src.core.config import settings
+
+async def get_connection():
+    try:
+        from google.cloud.sql.connector import Connector
+        connector = Connector()
+        return await connector.connect_async(
+            settings.CLOUD_SQL_INSTANCE,
+            "asyncpg",
+            user=settings.DB_USER,
+            password=settings.DB_PASSWORD,
+            db=settings.DB_NAME,
+        )
+    except Exception as e:
+        print(f"Error de conexión: {e}")
+        raise e
+
+# ── Engine ────────────────────────────────────────────────────────
+# IMPORTANTE: Solo usa Google si la variable tiene el formato 'proyecto:region:instancia'
+if settings.CLOUD_SQL_INSTANCE and ":" in settings.CLOUD_SQL_INSTANCE:
+    engine = create_async_engine(
+        "postgresql+asyncpg://",
+        async_creator=get_connection,
+        echo=settings.DEBUG,
+    )
+else:
+    # USO LOCAL (DOCKER)
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=settings.DEBUG,
+    )
+
+AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+--- FILE: src/models/db/patient_db.py ---
+# src/models/db/patient_db.py
+"""
+CarePath — Patient Database Model
+===================================
+SQLAlchemy model defining the 'patients' table structure.
+
+IMPORTANT: This is separate from src/models/patient.py
+  src/models/patient.py  → Pydantic model (API validation, serialization)
+  src/models/db/patient_db.py → SQLAlchemy model (database table structure)
+
+Why separate?
+Because they have different jobs. The Pydantic model validates
+HTTP requests and formats HTTP responses. The SQLAlchemy model
+maps to database tables and handles persistence.
+In a production system, these concerns must be separated.
+"""
+import uuid
+from datetime import date, datetime
+
+from sqlalchemy import Boolean, Date, DateTime, String, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from src.core.database import Base
+
+
+class PatientDB(Base):
+    """
+    Database table: patients
+
+    Mapped columns use Python types with SQLAlchemy's
+    Mapped[] annotation system (SQLAlchemy 2.0 style).
+    This gives type safety at the ORM level.
+    """
+    __tablename__ = "patients"
+    # __tablename__ tells SQLAlchemy what the table is called
+    # in the actual database. Convention: plural, snake_case.
+
+    # ── Primary Key ──────────────────────────────────────────────
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    # UUID primary key — same reasoning as in Pydantic model:
+    # no sequential IDs that reveal business information
+
+    # ── Personal Information ─────────────────────────────────────
+    first_name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    last_name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    email: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        unique=True,
+        index=True,
+        # unique=True → database enforces no duplicate emails
+        # index=True  → creates a B-tree index on this column
+        # Every time you search by email (login), PostgreSQL
+        # uses the index instead of scanning the entire table.
+        # Without index: O(n) scan. With index: O(log n).
+        # For a table with 1 million patients, this is the
+        # difference between 1ms and 1000ms per login query.
+    )
+    date_of_birth: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+    )
+    phone: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+    )
+
+    # ── Authentication ───────────────────────────────────────────
+    hashed_password: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        # We never store plain text passwords. Ever.
+        # bcrypt hash of the password lives here.
+        # Length 255 because bcrypt output is always 60 chars
+        # but 255 gives room for future hash algorithm changes.
+    )
+
+    # ── System Fields ────────────────────────────────────────────
+    role: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="patient",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        index=True,
+        # Index because every query filters by is_active=True
+        # Soft delete: active patients only in normal queries
+    )
+
+    # ── Timestamps ───────────────────────────────────────────────
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        # server_default=func.now() → the DATABASE sets this timestamp
+        # not Python. Why? Because the DB server's clock is the
+        # single source of truth. Multiple API servers might have
+        # slightly different clocks. The DB clock never drifts.
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        # onupdate=func.now() → automatically updates this timestamp
+        # every time any field on this row changes.
+        # No need to manually set updated_at in your code.
+    )
+    
+
+
+--- FILE: src/api/v1/endpoints/auth.py ---
+from typing import List
+import logging
+from datetime import date
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel, EmailStr
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.database import get_db
+from src.core.security import create_access_token, verify_password, hash_password
+from src.models.db.patient_db import PatientDB
+from src.api.deps import get_current_user   # ✅ FIX: protección endpoint
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# ROUTER
+# ─────────────────────────────────────────────
+router = APIRouter(prefix="/auth", tags=["authentication"])
+
+# ─────────────────────────────────────────────
+# SCHEMAS
+# ─────────────────────────────────────────────
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    first_name: str
+    last_name: str
+    date_of_birth: date   # ✅ requerido por DB
+
+
+# ─────────────────────────────────────────────
+# REGISTER
+# ─────────────────────────────────────────────
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register(
+    user_in: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        # 1. Verificar si el usuario ya existe
+        result = await db.execute(
+            select(PatientDB).where(PatientDB.email == user_in.email)
+        )
+
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+
+        # 2. Crear usuario
+        new_user = PatientDB(
+            email=user_in.email,
+            hashed_password=hash_password(user_in.password),
+            first_name=user_in.first_name,
+            last_name=user_in.last_name,
+            date_of_birth=user_in.date_of_birth,
+            is_active=True,
+            role="patient"
+        )
+
+        # 3. Guardar en DB
+        db.add(new_user)
+        await db.commit()
+        await db.refresh(new_user)
+
+        return {
+            "message": "User created successfully",
+            "id": str(new_user.id)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Registration failed: {str(e)}"
+        )
+
+
+# ─────────────────────────────────────────────
+# LOGIN
+# ─────────────────────────────────────────────
+@router.post("/login", response_model=Token)
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db),
+) -> Token:
+
+    logger.info(f"Login attempt: {form_data.username}")
+
+    try:
+        # 1. Buscar usuario
+        result = await db.execute(
+            select(PatientDB).where(PatientDB.email == form_data.username)
+        )
+
+        user = result.scalar_one_or_none()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # 2. Verificar password
+        if not verify_password(form_data.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # 3. Crear token
+        access_token = create_access_token(
+            subject=str(user.id),
+            role=user.role,
+        )
+
+        return Token(
+            access_token=access_token,
+            token_type="bearer"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login system error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service error",
+        )
+
+
+# ─────────────────────────────────────────────
+# USERS LIST (PROTEGIDO 🔐)
+# ─────────────────────────────────────────────
+@router.get("/users/list")
+async def get_all_users(
+    db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_user)  # 🔐 PROTEGIDO
+):
+    try:
+        logger.info(f"User list accessed by: {current_user.email}")
+
+        result = await db.execute(select(PatientDB))
+        users = result.scalars().all()
+
+        return [
+            {
+                "id": str(u.id),
+                "email": u.email,
+                "full_name": f"{u.first_name} {u.last_name}",
+                "date_of_birth": u.date_of_birth,
+                "role": u.role,
+                "is_active": u.is_active,
+            }
+            for u in users
+        ]
+
+    except Exception as e:
+        logger.error(f"Error fetching users list: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error retrieving users"
+        )
+
+--- FILE: .env ---
+# CarePath — Local Development Environment
+# =========================================
+# This file is in .gitignore — never commit it
+# Copy .env.example to .env and fill in your values
+
+APP_NAME=CarePath
+DEBUG=True
+
+# ── Base de datos local (desarrollo) ──────────────────────────────
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/carepath
+
+# ── Cloud SQL (producción en GCP) ─────────────────────────────────
+# Formato: proyecto:region:instancia
+CLOUD_SQL_INSTANCE=
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_NAME=carepath
+
+# ── Seguridad ─────────────────────────────────────────────────────
+SECRET_KEY=dev_secret_key_mora_sv
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+# ── AI / LLM ──────────────────────────────────────────────────────
+OPENAI_API_KEY=tu_key_aqui
+LLM_MODEL=gpt-4o-mini

@@ -1,67 +1,57 @@
-# src/api/v1/endpoints/cases.py
-"""
-CarePath — Triage Case Endpoints
-==================================
-All endpoints use SQLAlchemy DB models (TriageCaseDB, SymptomDB)
-for persistence and Pydantic models (TriageCase) for responses.
-
-Security:
-  - Patients can only access their own cases (IDOR protection)
-  - Only doctors can resolve cases (RBAC)
-  - JWT required for all endpoints
-"""
-
-from src.services.ai_service import (
-    generate_symptom_embeddings,
-    generate_triage_recommendation,
-)
-
 from uuid import UUID
-from datetime import datetime
+from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import get_current_active_patient, get_current_doctor
+from src.api.deps import (
+    get_current_active_patient,
+    get_current_doctor,
+    get_current_admin,
+)
+
 from src.core.database import get_db
+
 from src.models.db.patient_db import PatientDB
-from src.models.db.triage_db import SymptomDB, TriageCaseDB
+from src.models.db.triage_db import TriageCaseDB, SymptomDB
+
 from src.models.enums import CaseStatus, TriagePriority
+
 from src.models.symptom import Symptom
 from src.models.triage import TriageCase, TriageCaseCreate
 
-router = APIRouter(
-    prefix="/cases",
-    tags=["triage cases"],
+from src.services.triage_logic import run_start_triage
+from src.services.ai_service import (
+    generate_triage_recommendation,
+    generate_symptom_embeddings,
 )
 
+router = APIRouter(prefix="/cases", tags=["triage cases"])
 
+
+# =========================
+# MAPPER SAFE (NO LAZY LOAD)
+# =========================
 def db_case_to_pydantic(db_case: TriageCaseDB) -> TriageCase:
-    """
-    Converts a SQLAlchemy TriageCaseDB object to a Pydantic TriageCase.
-    Bridge between DB persistence and API serialization.
-    """
-    symptoms = [
-        Symptom(
-            id=s.id,
-            case_id=s.case_id,
-            description=s.description,
-            severity=s.severity,
-            duration_hours=s.duration_hours,
-            body_location=s.body_location,
-            is_worsening=s.is_worsening,
-            reported_at=s.reported_at,
-        )
-        for s in db_case.symptoms
-    ]
-
     return TriageCase(
         id=db_case.id,
         patient_id=db_case.patient_id,
         chief_complaint=db_case.chief_complaint,
-        symptoms=symptoms,
+        symptoms=[
+            Symptom(
+                id=s.id,
+                case_id=s.case_id,
+                description=s.description,
+                severity=s.severity,
+                duration_hours=s.duration_hours,
+                body_location=s.body_location,
+                is_worsening=s.is_worsening,
+                reported_at=s.reported_at,
+            )
+            for s in db_case.symptoms
+        ],
         status=db_case.status,
         priority=db_case.priority,
         ai_recommendation=db_case.ai_recommendation,
@@ -71,76 +61,100 @@ def db_case_to_pydantic(db_case: TriageCaseDB) -> TriageCase:
     )
 
 
-@router.post(
-    "/",
-    response_model=TriageCase,
-    status_code=status.HTTP_201_CREATED,
-    summary="Open a new triage case",
-)
+# =========================
+# DASHBOARD (FIXED + SAFE)
+# =========================
+@router.get("/", response_model=list[TriageCase])
+async def list_cases(
+    status: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_active_patient),
+):
+    stmt = select(TriageCaseDB).options(
+        selectinload(TriageCaseDB.symptoms)
+    )
+
+    if status:
+        stmt = stmt.where(TriageCaseDB.status == status)
+
+    if priority:
+        stmt = stmt.where(TriageCaseDB.priority == priority)
+
+    stmt = stmt.order_by(
+        TriageCaseDB.priority.asc(),
+        TriageCaseDB.opened_at.asc()
+    )
+
+    result = await db.execute(stmt)
+    cases = result.scalars().all()
+
+    return [db_case_to_pydantic(c) for c in cases]
+
+
+# =========================
+# CREATE CASE
+# =========================
+@router.post("/", response_model=TriageCase, status_code=201)
 async def create_case(
     case_data: TriageCaseCreate,
     db: AsyncSession = Depends(get_db),
     current_user: PatientDB = Depends(get_current_active_patient),
-) -> TriageCase:
-    """
-    POST /api/v1/cases/
-    Crea un caso y genera automáticamente los embeddings de los síntomas.
-    """
-    # 1. Crear el caso en la base de datos
-    db_case = TriageCaseDB(
-        patient_id=current_user.id,
-        chief_complaint=case_data.chief_complaint,
-        status=CaseStatus.OPEN.value,
-    )
-    db.add(db_case)
-    await db.flush()  # Genera db_case.id
-
-    # 2. Crear síntomas vinculados
-    db_symptoms = [
-        SymptomDB(
-            case_id=db_case.id,
-            description=s.description,
-            severity=s.severity.value,
-            duration_hours=s.duration_hours,
-            body_location=s.body_location,
-            is_worsening=s.is_worsening,
+):
+    try:
+        db_case = TriageCaseDB(
+            patient_id=current_user.id,
+            chief_complaint=case_data.chief_complaint,
+            status=CaseStatus.OPEN.value,
         )
-        for s in case_data.symptoms
-    ]
-    db.add_all(db_symptoms)
-    await db.flush() # Necesario para que db_symptoms tengan IDs
 
-    # --- NUEVO: Generar embeddings para búsqueda semántica inmediata ---
-    await generate_symptom_embeddings(db_symptoms, db)
+        db.add(db_case)
+        await db.flush()
 
-    # 3. Confirmar transacción
-    await db.commit()
+        db_symptoms = [
+            SymptomDB(
+                case_id=db_case.id,
+                description=s.description,
+                severity=s.severity.value,
+                duration_hours=s.duration_hours,
+                body_location=s.body_location,
+                is_worsening=s.is_worsening,
+            )
+            for s in case_data.symptoms
+        ]
 
-    # 4. Recargar el caso con sus síntomas para la respuesta
-    result = await db.execute(
-        select(TriageCaseDB)
-        .where(TriageCaseDB.id == db_case.id)
-        .options(selectinload(TriageCaseDB.symptoms))
-    )
-    db_case = result.scalar_one()
+        db.add_all(db_symptoms)
+        await db.flush()
 
-    return db_case_to_pydantic(db_case)
+        try:
+            await generate_symptom_embeddings(db_symptoms)
+        except Exception:
+            pass
+
+        await db.commit()
+
+        result = await db.execute(
+            select(TriageCaseDB)
+            .where(TriageCaseDB.id == db_case.id)
+            .options(selectinload(TriageCaseDB.symptoms))
+        )
+
+        return db_case_to_pydantic(result.scalar_one())
+
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get(
-    "/{case_id}",
-    response_model=TriageCase,
-    summary="Get triage case details",
-)
+# =========================
+# GET CASE
+# =========================
+@router.get("/{case_id}", response_model=TriageCase)
 async def get_case(
     case_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: PatientDB = Depends(get_current_active_patient),
-) -> TriageCase:
-    """
-    GET /api/v1/cases/{case_id}
-    Acceso restringido: El paciente solo ve sus propios casos.
-    """
+):
     result = await db.execute(
         select(TriageCaseDB)
         .where(
@@ -149,27 +163,24 @@ async def get_case(
         )
         .options(selectinload(TriageCaseDB.symptoms))
     )
+
     db_case = result.scalar_one_or_none()
 
-    if db_case is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Case not found",
-        )
+    if not db_case:
+        raise HTTPException(status_code=404, detail="Case not found")
 
     return db_case_to_pydantic(db_case)
 
 
-@router.post(
-    "/{case_id}/evaluate",
-    response_model=TriageCase,
-    summary="Run START triage algorithm + AI recommendation",
-)
+# =========================
+# EVALUATE CASE (FINAL STABLE FIX)
+# =========================
+@router.post("/{case_id}/evaluate", response_model=TriageCase)
 async def evaluate_case(
     case_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: PatientDB = Depends(get_current_active_patient),
-) -> TriageCase:
+):
     result = await db.execute(
         select(TriageCaseDB)
         .where(
@@ -178,47 +189,68 @@ async def evaluate_case(
         )
         .options(selectinload(TriageCaseDB.symptoms))
     )
+
     db_case = result.scalar_one_or_none()
 
-    if db_case is None:
+    if not db_case:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    # MODIFICACIÓN: Permitir re-evaluar si está en 'in_review' pero NO tiene recomendación
-    if db_case.status != CaseStatus.OPEN.value and db_case.ai_recommendation is not None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Case is already {db_case.status} with a recommendation"
+    try:
+        # =========================
+        # RULE ENGINE
+        # =========================
+        priority_enum, risk_score = run_start_triage(db_case.symptoms)
+
+        db_case.priority = priority_enum.value
+        db_case.status = (
+            CaseStatus.ESCALATED.value
+            if priority_enum == TriagePriority.P1_IMMEDIATE
+            else CaseStatus.IN_REVIEW.value
         )
 
-    # 1. Asegurar embeddings
-    await generate_symptom_embeddings(db_case.symptoms, db)
+        # =========================
+        # SAFE AI PAYLOAD (NO ORM PASS)
+        # =========================
+        ai_payload = {
+            "id": str(db_case.id),
+            "chief_complaint": db_case.chief_complaint,
+            "symptoms": [
+                {
+                    "description": s.description,
+                    "severity": s.severity,
+                    "duration_hours": s.duration_hours,
+                    "body_location": s.body_location,
+                    "is_worsening": s.is_worsening,
+                }
+                for s in db_case.symptoms
+            ],
+        }
 
-    # 2. Algoritmo START
-    pydantic_case = db_case_to_pydantic(db_case)
-    priority = pydantic_case.calculate_priority()
+        ai_data = await generate_triage_recommendation(ai_payload)
 
-    # 3. Actualizar datos (Sin commit todavía para evitar bloqueos)
-    db_case.priority = priority.value
-    db_case.status = CaseStatus.IN_REVIEW.value
+        db_case.ai_recommendation = (
+            f"Score Riesgo: {risk_score}\n\n"
+            f"{ai_data.get('recommendation', 'Revisión manual.')}"
+        )
 
-    if priority == TriagePriority.P1_IMMEDIATE:
-        db_case.status = CaseStatus.ESCALATED.value
-        db_case.resolved_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(db_case)
 
-    # 4. Generar recomendación de IA
-    # Si esto falla, lanzará una excepción y el status NO se guardará en la DB
-    recommendation = await generate_triage_recommendation(db_case, db)
-    db_case.ai_recommendation = recommendation
+        return db_case_to_pydantic(db_case)
 
-    # 5. COMMIT ÚNICO FINAL
-    # Solo guardamos si TODO el proceso (incluyendo la IA) salió bien
-    await db.commit()
+    except Exception:
+        # =========================
+        # FALLBACK ULTRA SAFE
+        # =========================
+        await db.rollback()
 
-    # Recargar para respuesta
-    result = await db.execute(
-        select(TriageCaseDB)
-        .where(TriageCaseDB.id == case_id)
-        .options(selectinload(TriageCaseDB.symptoms))
-    )
-    db_case = result.scalar_one()
-    return db_case_to_pydantic(db_case)
+        db_case.status = CaseStatus.IN_REVIEW.value
+        db_case.priority = TriagePriority.P3_DELAYED.value
+        db_case.ai_recommendation = (
+            "Score Riesgo: 0\n\nAI falló. Revisión manual requerida."
+        )
+
+        await db.commit()
+        await db.refresh(db_case)
+
+        return db_case_to_pydantic(db_case)

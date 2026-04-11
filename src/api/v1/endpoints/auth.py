@@ -1,110 +1,180 @@
-# src/api/v1/endpoints/auth.py
-"""
-CarePath — Authentication Endpoints
-=====================================
-Handles login and token operations.
+from typing import List
+import logging
+from datetime import date
 
-POST /auth/login  → authenticate and receive JWT token
-POST /auth/logout → invalidate token (client-side)
-
-Why OAuth2 password flow?
-Because it's the standard that every HTTP client,
-browser, and mobile app already knows how to use.
-FastAPI's OAuth2PasswordRequestForm handles the
-username/password parsing automatically.
-"""
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.database import get_db
-from src.core.security import create_access_token, verify_password
+from src.core.security import create_access_token, verify_password, hash_password
 from src.models.db.patient_db import PatientDB
+from src.api.deps import get_current_user   # ✅ FIX: protección endpoint
 
-router = APIRouter(
-    prefix="/auth",
-    tags=["authentication"],
-)
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────
+# ROUTER
+# ─────────────────────────────────────────────
+router = APIRouter(prefix="/auth", tags=["authentication"])
 
+# ─────────────────────────────────────────────
+# SCHEMAS
+# ─────────────────────────────────────────────
 class Token(BaseModel):
-    """
-    OAuth2 token response schema.
-    Standard format defined by OAuth2 specification.
-    Every OAuth2 client expects exactly these fields.
-    """
     access_token: str
     token_type: str = "bearer"
-    # token_type is always "bearer" for JWT
-    # "bearer" means "whoever bears this token has access"
 
 
-class TokenData(BaseModel):
-    """Data extracted from a decoded JWT token."""
-    user_id: str
-    role: str
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    first_name: str
+    last_name: str
+    date_of_birth: date   # ✅ requerido por DB
 
 
-@router.post(
-    "/login",
-    response_model=Token,
-    summary="Login and receive JWT token",
-    description="""
-    Authenticates a user with email and password.
-    Returns a JWT access token valid for 30 minutes.
-    
-    Include the token in subsequent requests:
-    `Authorization: Bearer <token>`
-    
-    Uses OAuth2 password flow — send credentials
-    as form data, not JSON.
-    """,
-)
+# ─────────────────────────────────────────────
+# REGISTER
+# ─────────────────────────────────────────────
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register(
+    user_in: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        # 1. Verificar si el usuario ya existe
+        result = await db.execute(
+            select(PatientDB).where(PatientDB.email == user_in.email)
+        )
+
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+
+        # 2. Crear usuario
+        new_user = PatientDB(
+            email=user_in.email,
+            hashed_password=hash_password(user_in.password),
+            first_name=user_in.first_name,
+            last_name=user_in.last_name,
+            date_of_birth=user_in.date_of_birth,
+            is_active=True,
+            role="patient"
+        )
+
+        # 3. Guardar en DB
+        db.add(new_user)
+        await db.commit()
+        await db.refresh(new_user)
+
+        return {
+            "message": "User created successfully",
+            "id": str(new_user.id)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Registration failed: {str(e)}"
+        )
+
+
+# ─────────────────────────────────────────────
+# LOGIN
+# ─────────────────────────────────────────────
+@router.post("/login", response_model=Token)
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db),
 ) -> Token:
-    """
-    POST /api/v1/auth/login
-    
-    OAuth2PasswordRequestForm automatically parses:
-      - username (we use email as username)
-      - password
-    
-    Sent as form data (application/x-www-form-urlencoded)
-    not JSON — this is the OAuth2 standard.
-    """
-    # Find user by email
-    # OAuth2 uses 'username' field — we treat it as email
-    result = await db.execute(
-        select(PatientDB).where(
-            PatientDB.email == form_data.username,
-            PatientDB.is_active == True,  # noqa: E712
-        )
-    )
-    user = result.scalar_one_or_none()
 
-    # Verify credentials
-    # We check both conditions together and return the same
-    # error message for both cases — this is intentional.
-    # Separate messages ("user not found" vs "wrong password")
-    # help attackers enumerate valid usernames. Same message
-    # for both cases prevents this (user enumeration attack).
-    if user is None or not verify_password(
-        form_data.password, user.hashed_password
-    ):
+    logger.info(f"Login attempt: {form_data.username}")
+
+    try:
+        # 1. Buscar usuario
+        result = await db.execute(
+            select(PatientDB).where(PatientDB.email == form_data.username)
+        )
+
+        user = result.scalar_one_or_none()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # 2. Verificar password
+        if not verify_password(form_data.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # 3. Crear token
+        access_token = create_access_token(
+            subject=str(user.id),
+            role=user.role,
+        )
+
+        return Token(
+            access_token=access_token,
+            token_type="bearer"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login system error: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service error",
         )
 
-    # Create JWT token
-    access_token = create_access_token(
-        subject=user.id,
-        role=user.role,
-    )
 
-    return Token(access_token=access_token)
+# ─────────────────────────────────────────────
+# USERS LIST (PROTEGIDO 🔐)
+# ─────────────────────────────────────────────
+@router.get("/users/list")
+async def get_all_users(
+    db: AsyncSession = Depends(get_db),
+    current_user: PatientDB = Depends(get_current_user)  # 🔐 PROTEGIDO
+):
+    try:
+        logger.info(f"User list accessed by: {current_user.email}")
+
+        result = await db.execute(select(PatientDB))
+        users = result.scalars().all()
+
+        return [
+            {
+                "id": str(u.id),
+                "email": u.email,
+                "full_name": f"{u.first_name} {u.last_name}",
+                "date_of_birth": u.date_of_birth,
+                "role": u.role,
+                "is_active": u.is_active,
+            }
+            for u in users
+        ]
+
+    except Exception as e:
+        logger.error(f"Error fetching users list: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error retrieving users"
+        )

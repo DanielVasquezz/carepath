@@ -1,31 +1,38 @@
+cat << 'EOF' > .gitignore
+# ── Entornos virtuales ────────────────────────────────
 venv/
 .venv/
 env/
 
+# ── Variables de entorno ──────────────────────────────
 .env
 .env.local
 .env.production
 *.env
 
+# ── Python ────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
+
+# ── Testing y tipado ──────────────────────────────────
 .pytest_cache/
 .mypy_cache/
 
+# ── Editor ────────────────────────────────────────────
 .vscode/settings.json
-
-
 .DS_Store
 
+# ── Logs ──────────────────────────────────────────────
 *.log
 logs/
 
+# ── Docker ────────────────────────────────────────────
+.dockerignore
 
-*.dockerignore
-
-
+# ── Terraform ─────────────────────────────────────────
 infra/.terraform/
 infra/*.tfstate
 infra/*.tfstate.backup
 infra/.terraform.lock.hcl
+EOF

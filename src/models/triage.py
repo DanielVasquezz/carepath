@@ -7,76 +7,114 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field, computed_field
 
 from src.models.enums import CaseStatus, SeverityLevel, TriagePriority
-from src.models.symptom import Symptom, SymptomCreate
 
 
+# ─────────────────────────────────────────────
+# SYMPTOM SCHEMAS
+# ─────────────────────────────────────────────
+class SymptomBase(BaseModel):
+    description: str = Field(..., example="Dolor agudo en el pecho")
+    severity: SeverityLevel
+    duration_hours: Optional[float] = Field(None, ge=0)
+    body_location: Optional[str] = None
+    is_worsening: bool = False
+
+
+class SymptomCreate(SymptomBase):
+    pass
+
+
+class Symptom(SymptomBase):
+    id: UUID
+    case_id: UUID
+    reported_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ─────────────────────────────────────────────
+# TRIAGE CASE CREATE
+# ─────────────────────────────────────────────
 class TriageCaseCreate(BaseModel):
     """
     Data required to open a new triage case.
-    Received by: POST /api/v1/cases
-
-    patient_id is Optional here because it is injected
-    automatically from the JWT token in the endpoint.
-    Any value sent in the request body is ignored.
     """
-    patient_id: UUID | None = Field(
+    patient_id: Optional[UUID] = Field(
         default=None,
-        description="Ignored — taken from JWT token automatically"
+        description="Ignored — taken from JWT token"
     )
+
     chief_complaint: str = Field(
         ...,
         min_length=10,
         max_length=500,
-        description="Main reason the patient is seeking care"
+        description="Main reason for consultation"
     )
+
     symptoms: list[SymptomCreate] = Field(
         ...,
         min_length=1,
-        description="At least one symptom required to open a case"
+        description="At least one symptom required"
     )
 
 
+# ─────────────────────────────────────────────
+# TRIAGE CASE (DOMAIN MODEL)
+# ─────────────────────────────────────────────
 class TriageCase(BaseModel):
     """
-    Central entity that orchestrates CarePath's triage process.
+    Central entity for CarePath triage system.
 
     State machine:
-        OPEN → IN_REVIEW → RESOLVED
-        OPEN → IN_REVIEW → ESCALATED
-
-    A case never moves backwards. Medical records are permanent.
+        OPEN → IN_REVIEW → RESOLVED / ESCALATED
     """
-    id: UUID = Field(default_factory=uuid4)
-    patient_id: UUID = Field(..., description="Patient who opened this case")
-    chief_complaint: str = Field(..., min_length=10, max_length=500)
-    symptoms: list[Symptom] = Field(default_factory=list)
-    status: CaseStatus = Field(default=CaseStatus.OPEN)
-    priority: Optional[TriagePriority] = Field(default=None)
-    ai_recommendation: Optional[str] = Field(default=None)
-    attending_doctor_id: Optional[UUID] = Field(default=None)
-    opened_at: datetime = Field(default_factory=datetime.utcnow)
-    resolved_at: Optional[datetime] = Field(default=None)
 
+    id: UUID = Field(default_factory=uuid4)
+    patient_id: UUID
+
+    chief_complaint: str
+    symptoms: list[Symptom] = Field(default_factory=list)
+
+    status: CaseStatus = Field(default=CaseStatus.OPEN)
+    priority: Optional[TriagePriority] = None
+
+    ai_recommendation: Optional[str] = None
+    attending_doctor_id: Optional[UUID] = None
+
+    opened_at: datetime = Field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
+
+    # ─────────────────────────────────────────────
+    # COMPUTED FIELDS
+    # ─────────────────────────────────────────────
     @computed_field
     @property
     def total_risk_score(self) -> int:
-        """Sum of risk_score across all symptoms."""
-        return sum(symptom.risk_score for symptom in self.symptoms)
+        """
+        Sum of severity scores:
+        LOW=1, MODERATE=2, HIGH=3, CRITICAL=4
+        """
+        score_map = {
+            SeverityLevel.LOW: 1,
+            SeverityLevel.MODERATE: 2,
+            SeverityLevel.HIGH: 3,
+            SeverityLevel.CRITICAL: 4,
+        }
+
+        return sum(score_map.get(s.severity, 1) for s in self.symptoms)
 
     @computed_field
     @property
     def has_critical_symptom(self) -> bool:
-        """True if ANY symptom is CRITICAL — triggers P1 immediately."""
         return any(
-            symptom.severity == SeverityLevel.CRITICAL
-            for symptom in self.symptoms
+            s.severity == SeverityLevel.CRITICAL
+            for s in self.symptoms
         )
 
+    # ─────────────────────────────────────────────
+    # BUSINESS LOGIC (START)
+    # ─────────────────────────────────────────────
     def calculate_priority(self) -> TriagePriority:
-        """
-        START triage protocol implementation.
-        Side effects: sets self.priority, transitions to IN_REVIEW.
-        """
         if self.has_critical_symptom:
             priority = TriagePriority.P1_IMMEDIATE
         elif self.total_risk_score >= 8:
@@ -91,30 +129,19 @@ class TriageCase(BaseModel):
         return priority
 
     def resolve(self, recommendation: str) -> None:
-        """
-        Closes the case with a recommendation.
-        Transition: IN_REVIEW → RESOLVED
-        """
         self.ai_recommendation = recommendation
         self.status = CaseStatus.RESOLVED
         self.resolved_at = datetime.utcnow()
 
     def escalate(self) -> None:
-        """
-        Escalates to emergency services.
-        Transition: IN_REVIEW → ESCALATED
-        Irreversible.
-        """
         self.status = CaseStatus.ESCALATED
         self.priority = TriagePriority.P1_IMMEDIATE
         self.resolved_at = datetime.utcnow()
 
     @property
     def resolution_time_minutes(self) -> Optional[float]:
-        """Minutes between opening and resolution. None if still open."""
-        if self.resolved_at is None:
+        if not self.resolved_at:
             return None
-        delta = self.resolved_at - self.opened_at
-        return delta.total_seconds() / 60
+        return (self.resolved_at - self.opened_at).total_seconds() / 60
 
     model_config = {"from_attributes": True}
