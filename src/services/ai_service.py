@@ -1,19 +1,65 @@
 import logging
 import openai
+import traceback
+import json
 from uuid import UUID
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
-from src.models.enums import TriagePriority
 
 logger = logging.getLogger(__name__)
 
 client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 EMBEDDING_DIM = 768
+
+# =========================
+# RED FLAGS (BILINGÜE)
+# =========================
+RED_FLAGS = [
+    "chest", "pecho", "corazón", "heart",
+    "breathing", "respirar", "aire", "breath",
+    "unconscious", "inconsciente", "desmayo", "faint",
+    "stroke", "derrame", "parálisis",
+    "head", "cabeza", "fuerte dolor"
+]
+
+def validate_risk_score(symptoms: str, current_score: int) -> int:
+    symptoms_lower = symptoms.lower()
+
+    if any(flag in symptoms_lower for flag in RED_FLAGS):
+        logger.info("🚩 Red Flag detectada → elevando riesgo mínimo a 7")
+        return max(current_score, 7)
+
+    return current_score
+
+
+# =========================
+# JSON PARSER ROBUSTO 🔥
+# =========================
+def safe_parse_json(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+
+    except json.JSONDecodeError:
+        logger.warning("⚠️ JSON inválido, intentando limpiar respuesta IA")
+
+        cleaned = raw.strip()
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+
+        if start != -1 and end != -1:
+            cleaned = cleaned[start:end]
+
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            logger.error(f"❌ JSON imposible de parsear:\n{raw}")
+            raise
 
 
 # =========================
@@ -29,30 +75,31 @@ async def generate_query_embedding(text_input: str) -> List[float]:
         return response.data[0].embedding
 
     except Exception as e:
-        logger.error(f"Error generating embedding: {e}")
+        logger.error(f"Embedding error: {e}")
         return [0.0] * EMBEDDING_DIM
 
 
 async def generate_symptom_embeddings(db_symptoms: List[Any]) -> None:
-    """
-    Genera embeddings sin romper flujo si OpenAI falla.
-    """
     for symptom in db_symptoms:
         try:
             symptom.embedding = await generate_query_embedding(symptom.description)
         except Exception as e:
-            logger.warning(f"Embedding failed for {symptom.id}: {e}")
+            logger.warning(f"Embedding falló para {symptom.id}: {e}")
 
 
 # =========================
-# RAG SEARCH (SAFE)
+# RAG SEARCH
 # =========================
 async def find_similar_cases(
-    session: AsyncSession,
+    session: Optional[AsyncSession],
     query_text: str,
     limit: int = 3,
     exclude_case_id: str | UUID | None = None,
 ) -> List[Dict[str, Any]]:
+
+    if not session:
+        return []
+
     try:
         query_embedding = await generate_query_embedding(query_text)
 
@@ -88,70 +135,142 @@ async def find_similar_cases(
         ]
 
     except Exception as e:
-        logger.error(f"Vector search failed: {e}")
+        logger.error(f"Vector search error: {e}")
         return []
 
 
 # =========================
-# TRIAGE AI ENGINE
+# TRIAGE AI ENGINE FINAL (FIXED)
 # =========================
 async def generate_triage_recommendation(
-    db_case: Any,
-    session: AsyncSession,
+    case_data: dict,
+    session: Optional[AsyncSession] = None,
 ) -> Dict[str, Any]:
-    """
-    IA completamente aislada del estado de SQLAlchemy.
-    """
+
     try:
-        logger.info(f"Evaluando caso {db_case.id}")
+        logger.info(f"🧠 Evaluando caso IA: {case_data.get('id')}")
 
+        # =========================
+        # SÍNTOMAS
+        # =========================
         symptoms_text = "\n".join(
-            f"- {s.description} (Severidad: {s.severity})"
-            for s in db_case.symptoms
+            f"- {s['description']} (Severidad: {s['severity']})"
+            for s in case_data["symptoms"]
         )
 
-        similar_cases = await find_similar_cases(
-            session=session,
-            query_text=db_case.chief_complaint,
-            limit=2,
-            exclude_case_id=db_case.id,
-        )
+        # =========================
+        # VALIDACIÓN INICIAL
+        # =========================
+        validated_score = validate_risk_score(symptoms_text, 0)
 
+        # =========================
+        # RAG
+        # =========================
         rag_context = ""
-        if similar_cases:
-            rag_context = "\nCasos similares:\n" + "\n".join(
-                f"- {c['chief_complaint']} (similitud: {c['similarity']})"
-                for c in similar_cases
+        if session:
+            similar_cases = await find_similar_cases(
+                session=session,
+                query_text=case_data["chief_complaint"],
+                limit=2,
+                exclude_case_id=case_data.get("id"),
             )
 
-        prompt = f"""
-Eres un médico experto en triaje.
+            if similar_cases:
+                rag_context = "\nCasos similares:\n" + "\n".join(
+                    f"- {c['chief_complaint']} ({c['similarity']})"
+                    for c in similar_cases
+                )
 
-Motivo: {db_case.chief_complaint}
+        # =========================
+        # PROMPT MEJORADO
+        # =========================
+        prompt = f"""
+Eres un médico experto en triaje clínico.
+
+Motivo: {case_data['chief_complaint']}
 
 Síntomas:
 {symptoms_text}
 
 {rag_context}
 
-Da una recomendación clínica breve y clara.
+Evalúa el riesgo del paciente.
+
+IMPORTANTE:
+- El risk_score debe ser un ENTERO del 1 al 10 (sin comillas).
+- Si hay síntomas críticos, el score NO puede ser menor a {validated_score}.
+- Responde SOLO en JSON válido.
+- NO incluyas texto fuera del JSON.
+
+Formato EXACTO:
+{{
+  "risk_score": 7,
+  "recommendation": "explicación breve en español"
+}}
 """
 
-        response = await client.chat.completions.create(
+        # =========================
+        # IA (FIX REAL)
+        # =========================
+        response = await client.responses.create(
             model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            input=[
+                {"role": "system", "content": "Eres un sistema médico. Responde SOLO JSON válido."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
         )
 
-        ai_text = response.choices[0].message.content
+        raw = response.output[0].content[0].text
+
+        logger.info(f"🧾 RAW IA RESPONSE:\n{raw}")
+
+        # =========================
+        # PARSEO
+        # =========================
+        ai_data = safe_parse_json(raw)
+
+        # =========================
+        # VALIDACIÓN SEGURA DEL SCORE
+        # =========================
+        try:
+            ai_score = int(ai_data.get("risk_score", 5))
+        except Exception:
+            logger.warning("⚠️ Score inválido desde IA, usando fallback")
+            ai_score = 5
+
+        # =========================
+        # VALIDACIÓN FINAL
+        # =========================
+        final_score = validate_risk_score(symptoms_text, ai_score)
 
         return {
-            "recommendation": ai_text,
+            "recommendation": ai_data.get(
+                "recommendation",
+                "Se recomienda evaluación médica."
+            ),
+            "risk_score": final_score,
             "status": "success",
         }
 
     except Exception as e:
-        logger.error(f"Triage AI error: {e}")
+        print("\n" + "=" * 50)
+        print("❌ ERROR REAL EN IA:")
+        print(str(e))
+        traceback.print_exc()
+        print("=" * 50 + "\n")
+
+        logger.error(f"🔥 AI failure: {e}")
+
+        # =========================
+        # FALLBACK INTELIGENTE
+        # =========================
+        fallback_score = validate_risk_score(
+            case_data.get("chief_complaint", ""), 5
+        )
+
         return {
-            "recommendation": "Error en evaluación. Revisión médica manual.",
-            "status": "error",
+            "recommendation": "⚠️ IA no disponible. Evaluación manual aplicada.",
+            "risk_score": fallback_score,
+            "status": "fallback",
         }
